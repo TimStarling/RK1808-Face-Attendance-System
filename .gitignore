@@ -1,0 +1,21 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+
+# Native build outputs generated during redevelopment
+*.o
+*.a
+core
+core.*
+
+# Keep existing runtime binaries and SDK libraries in this repository.
+# Do not ignore app-runtime/, *.so, or extensionless executable files here.

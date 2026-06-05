@@ -1,0 +1,863 @@
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/input.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include "../rockx-rk1808-Linux/include/rockx.h"
+#include "DRMwrap.h"
+#include "camera.h"
+
+#define SCREEN_W 1024
+#define SCREEN_H 600
+
+#define BTN_ENROLL_X1 200
+#define BTN_ENROLL_Y1 200
+#define BTN_ENROLL_X2 471
+#define BTN_ENROLL_Y2 489
+
+#define BTN_CHECK_X1 548
+#define BTN_CHECK_Y1 200
+#define BTN_CHECK_X2 821
+#define BTN_CHECK_Y2 489
+
+#define BTN_ACTION_X1 700
+#define BTN_ACTION_Y1 150
+#define BTN_ACTION_X2 960
+#define BTN_ACTION_Y2 460
+
+#define FACE_MATCH_THRESHOLD 1.1f
+#define PREVIEW_X 0
+#define PREVIEW_Y 60
+#define PREVIEW_W 640
+#define PREVIEW_H 480
+#define FACE_DIR "./face"
+#define ENROLL_RAW_BMP FACE_DIR "/enroll_preview.bmp"
+#define ENROLL_BOX_BMP FACE_DIR "/enroll_preview_box.bmp"
+#define CHECK_RAW_BMP FACE_DIR "/check_preview.bmp"
+#define CHECK_BOX_BMP FACE_DIR "/check_preview_box.bmp"
+#define KEEP_FACE_BMP FACE_DIR "/keep_face.bmp"
+
+static struct drmHandle g_drm;
+static int g_drm_fd = -1;
+static int g_video_fd = -1;
+static int g_touch_fd = -1;
+static volatile sig_atomic_t g_running = 1;
+
+static rockx_handle_t g_face_det_handle;
+static rockx_handle_t g_face_5landmarks_handle;
+static rockx_handle_t g_face_recognize_handle;
+static rockx_face_feature_t g_enrolled_feature;
+static int g_enrolled_ready = 0;
+static int g_drm_ready = 0;
+static int g_face_det_ready = 0;
+static int g_face_5landmarks_ready = 0;
+static int g_face_recognize_ready = 0;
+
+static void handle_signal(int sig) {
+    (void)sig;
+    g_running = 0;
+}
+
+static int in_rect(int x, int y, int x1, int y1, int x2, int y2) {
+    return x >= x1 && x <= x2 && y >= y1 && y <= y2;
+}
+
+static int read_all(int fd, void *buf, size_t size) {
+    unsigned char *p = buf;
+    size_t total = 0;
+
+    while (total < size) {
+        ssize_t n = read(fd, p + total, size - total);
+        if (n <= 0) {
+            return -1;
+        }
+        total += n;
+    }
+
+    return 0;
+}
+
+static int ensure_face_dir(void) {
+    if (mkdir(FACE_DIR, 0777) == -1 && errno != EEXIST) {
+        perror("mkdir face dir error");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int init_touch(void) {
+    int fd = open("/dev/input/event1", O_RDONLY | O_NONBLOCK);
+    if (fd >= 0) {
+        return fd;
+    }
+
+    fd = open("/dev/input/event2", O_RDONLY | O_NONBLOCK);
+    if (fd >= 0) {
+        return fd;
+    }
+
+    perror("open touch device error");
+    return -1;
+}
+
+static int wait_touch(int *out_x, int *out_y) {
+    struct input_event ev;
+    int x = -1;
+    int y = -1;
+
+    while (g_running) {
+        ssize_t n = read(g_touch_fd, &ev, sizeof(ev));
+        if (n != sizeof(ev)) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                usleep(10000);
+                continue;
+            }
+            return -1;
+        }
+
+        if (ev.type == EV_ABS) {
+            if (ev.code == ABS_X || ev.code == ABS_MT_POSITION_X) {
+                x = ev.value;
+            } else if (ev.code == ABS_Y || ev.code == ABS_MT_POSITION_Y) {
+                y = ev.value;
+            }
+        } else if (ev.type == EV_KEY && ev.code == BTN_TOUCH && ev.value == 0) {
+            if (x >= 0 && y >= 0) {
+                *out_x = x;
+                *out_y = y;
+                printf("touch x=%d y=%d\n", x, y);
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+static int poll_touch(int *out_x, int *out_y) {
+    static int last_x = -1;
+    static int last_y = -1;
+    struct input_event ev;
+
+    while (1) {
+        ssize_t n = read(g_touch_fd, &ev, sizeof(ev));
+        if (n != sizeof(ev)) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return 0;
+            }
+            return -1;
+        }
+
+        if (ev.type == EV_ABS) {
+            if (ev.code == ABS_X || ev.code == ABS_MT_POSITION_X) {
+                last_x = ev.value;
+            } else if (ev.code == ABS_Y || ev.code == ABS_MT_POSITION_Y) {
+                last_y = ev.value;
+            }
+        } else if (ev.type == EV_KEY && ev.code == BTN_TOUCH && ev.value == 0) {
+            if (last_x >= 0 && last_y >= 0) {
+                *out_x = last_x;
+                *out_y = last_y;
+                printf("touch x=%d y=%d\n", last_x, last_y);
+                return 1;
+            }
+        }
+    }
+}
+
+static void clear_screen_rect(int start_x, int start_y, int width, int height) {
+    unsigned char *screen = g_drm.vaddr;
+    if (screen == NULL) {
+        return;
+    }
+
+    for (int y = 0; y < height; y++) {
+        int screen_y = start_y + y;
+        if (screen_y < 0 || screen_y >= SCREEN_H) {
+            continue;
+        }
+
+        for (int x = 0; x < width; x++) {
+            int screen_x = start_x + x;
+            if (screen_x < 0 || screen_x >= SCREEN_W) {
+                continue;
+            }
+
+            int pos = 4 * (SCREEN_W * screen_y + screen_x);
+            screen[pos + 0] = 0;
+            screen[pos + 1] = 0;
+            screen[pos + 2] = 0;
+            screen[pos + 3] = 0;
+        }
+    }
+}
+
+static int bmp_draw_scaled(const char *bmp_path, int dst_x, int dst_y, int dst_w, int dst_h) {
+    int bmp_fd = open(bmp_path, O_RDONLY);
+    if (bmp_fd == -1) {
+        perror("open bmp file error");
+        return -1;
+    }
+
+    unsigned char header[54];
+    if (read_all(bmp_fd, header, sizeof(header)) == -1) {
+        perror("read bmp header error");
+        close(bmp_fd);
+        return -1;
+    }
+
+    if (header[0] != 'B' || header[1] != 'M') {
+        fprintf(stderr, "%s is not a BMP file\n", bmp_path);
+        close(bmp_fd);
+        return -1;
+    }
+
+    int data_offset = *(int *)&header[10];
+    int w = *(int *)&header[18];
+    int h = *(int *)&header[22];
+    short bits = *(short *)&header[28];
+
+    if (w <= 0 || h <= 0 || dst_w <= 0 || dst_h <= 0 || (bits != 24 && bits != 32)) {
+        fprintf(stderr, "unsupported bmp: width=%d height=%d bits=%d\n", w, h, bits);
+        close(bmp_fd);
+        return -1;
+    }
+
+    int bytes_per_pixel = bits / 8;
+    int row_size = ((w * bytes_per_pixel + 3) / 4) * 4;
+    size_t bmp_size = (size_t)row_size * h;
+    unsigned char *bmp_buf = malloc(bmp_size);
+    if (bmp_buf == NULL) {
+        perror("malloc bmp buffer error");
+        close(bmp_fd);
+        return -1;
+    }
+
+    if (lseek(bmp_fd, data_offset, SEEK_SET) == -1 ||
+        read_all(bmp_fd, bmp_buf, bmp_size) == -1) {
+        perror("read bmp data error");
+        free(bmp_buf);
+        close(bmp_fd);
+        return -1;
+    }
+    close(bmp_fd);
+
+    unsigned char *screen = g_drm.vaddr;
+    if (screen == NULL) {
+        fprintf(stderr, "drm.vaddr is NULL\n");
+        free(bmp_buf);
+        return -1;
+    }
+
+    for (int y = 0; y < dst_h; y++) {
+        int screen_y = dst_y + y;
+        if (screen_y < 0 || screen_y >= SCREEN_H) {
+            continue;
+        }
+
+        int src_y = y * h / dst_h;
+        for (int x = 0; x < dst_w; x++) {
+            int screen_x = dst_x + x;
+            if (screen_x < 0 || screen_x >= SCREEN_W) {
+                continue;
+            }
+
+            int src_x = x * w / dst_w;
+            int pos = 4 * (SCREEN_W * screen_y + screen_x);
+            int bmp_pos = row_size * (h - 1 - src_y) + bytes_per_pixel * src_x;
+
+            screen[pos + 0] = bmp_buf[bmp_pos + 0];
+            screen[pos + 1] = bmp_buf[bmp_pos + 1];
+            screen[pos + 2] = bmp_buf[bmp_pos + 2];
+            screen[pos + 3] = 0;
+        }
+    }
+
+    free(bmp_buf);
+    return 0;
+}
+
+static int bmp_draw_no_scale_region(const char *bmp_path,
+                                    int dst_x,
+                                    int dst_y,
+                                    int region_w,
+                                    int region_h) {
+    int bmp_fd = open(bmp_path, O_RDONLY);
+    if (bmp_fd == -1) {
+        perror("open bmp file error");
+        return -1;
+    }
+
+    unsigned char header[54];
+    if (read_all(bmp_fd, header, sizeof(header)) == -1) {
+        perror("read bmp header error");
+        close(bmp_fd);
+        return -1;
+    }
+
+    if (header[0] != 'B' || header[1] != 'M') {
+        fprintf(stderr, "%s is not a BMP file\n", bmp_path);
+        close(bmp_fd);
+        return -1;
+    }
+
+    int data_offset = *(int *)&header[10];
+    int w = *(int *)&header[18];
+    int h = *(int *)&header[22];
+    short bits = *(short *)&header[28];
+
+    if (w <= 0 || h <= 0 || region_w <= 0 || region_h <= 0 || (bits != 24 && bits != 32)) {
+        fprintf(stderr, "unsupported bmp: width=%d height=%d bits=%d\n", w, h, bits);
+        close(bmp_fd);
+        return -1;
+    }
+
+    int bytes_per_pixel = bits / 8;
+    int row_size = ((w * bytes_per_pixel + 3) / 4) * 4;
+    size_t bmp_size = (size_t)row_size * h;
+    unsigned char *bmp_buf = malloc(bmp_size);
+    if (bmp_buf == NULL) {
+        perror("malloc bmp buffer error");
+        close(bmp_fd);
+        return -1;
+    }
+
+    if (lseek(bmp_fd, data_offset, SEEK_SET) == -1 ||
+        read_all(bmp_fd, bmp_buf, bmp_size) == -1) {
+        perror("read bmp data error");
+        free(bmp_buf);
+        close(bmp_fd);
+        return -1;
+    }
+    close(bmp_fd);
+
+    unsigned char *screen = g_drm.vaddr;
+    if (screen == NULL) {
+        fprintf(stderr, "drm.vaddr is NULL\n");
+        free(bmp_buf);
+        return -1;
+    }
+
+    clear_screen_rect(dst_x, dst_y, region_w, region_h);
+
+    int draw_w = w < region_w ? w : region_w;
+    int draw_h = h < region_h ? h : region_h;
+    for (int y = 0; y < draw_h; y++) {
+        int screen_y = dst_y + y;
+        if (screen_y < 0 || screen_y >= SCREEN_H) {
+            continue;
+        }
+
+        for (int x = 0; x < draw_w; x++) {
+            int screen_x = dst_x + x;
+            if (screen_x < 0 || screen_x >= SCREEN_W) {
+                continue;
+            }
+
+            int pos = 4 * (SCREEN_W * screen_y + screen_x);
+            int bmp_pos = row_size * (h - 1 - y) + bytes_per_pixel * x;
+
+            screen[pos + 0] = bmp_buf[bmp_pos + 0];
+            screen[pos + 1] = bmp_buf[bmp_pos + 1];
+            screen[pos + 2] = bmp_buf[bmp_pos + 2];
+            screen[pos + 3] = 0;
+        }
+    }
+
+    free(bmp_buf);
+    return 0;
+}
+
+static int bmp_show(const char *bmp_path, int start_x, int start_y) {
+    int bmp_fd = open(bmp_path, O_RDONLY);
+    if (bmp_fd == -1) {
+        perror("open bmp file error");
+        return -1;
+    }
+
+    unsigned char header[54];
+    if (read_all(bmp_fd, header, sizeof(header)) == -1) {
+        perror("read bmp header error");
+        close(bmp_fd);
+        return -1;
+    }
+
+    if (header[0] != 'B' || header[1] != 'M') {
+        fprintf(stderr, "%s is not a BMP file\n", bmp_path);
+        close(bmp_fd);
+        return -1;
+    }
+
+    int data_offset = *(int *)&header[10];
+    int w = *(int *)&header[18];
+    int h = *(int *)&header[22];
+    short bits = *(short *)&header[28];
+
+    if (w <= 0 || h <= 0 || (bits != 24 && bits != 32)) {
+        fprintf(stderr, "unsupported bmp: width=%d height=%d bits=%d\n", w, h, bits);
+        close(bmp_fd);
+        return -1;
+    }
+
+    int bytes_per_pixel = bits / 8;
+    int row_size = ((w * bytes_per_pixel + 3) / 4) * 4;
+    size_t bmp_size = (size_t)row_size * h;
+    unsigned char *bmp_buf = malloc(bmp_size);
+    if (bmp_buf == NULL) {
+        perror("malloc bmp buffer error");
+        close(bmp_fd);
+        return -1;
+    }
+
+    if (lseek(bmp_fd, data_offset, SEEK_SET) == -1 ||
+        read_all(bmp_fd, bmp_buf, bmp_size) == -1) {
+        perror("read bmp data error");
+        free(bmp_buf);
+        close(bmp_fd);
+        return -1;
+    }
+    close(bmp_fd);
+
+    unsigned char *screen = g_drm.vaddr;
+    if (screen == NULL) {
+        fprintf(stderr, "drm.vaddr is NULL\n");
+        free(bmp_buf);
+        return -1;
+    }
+
+    memset(screen, 0, SCREEN_W * SCREEN_H * 4);
+
+    for (int y = 0; y < h; y++) {
+        int screen_y = start_y + y;
+        if (screen_y < 0 || screen_y >= SCREEN_H) {
+            continue;
+        }
+
+        for (int x = 0; x < w; x++) {
+            int screen_x = start_x + x;
+            if (screen_x < 0 || screen_x >= SCREEN_W) {
+                continue;
+            }
+
+            int pos = 4 * (SCREEN_W * screen_y + screen_x);
+            int bmp_pos = row_size * (h - 1 - y) + bytes_per_pixel * x;
+
+            screen[pos + 0] = bmp_buf[bmp_pos + 0];
+            screen[pos + 1] = bmp_buf[bmp_pos + 1];
+            screen[pos + 2] = bmp_buf[bmp_pos + 2];
+            screen[pos + 3] = 0;
+        }
+    }
+
+    DRMshowUp(g_drm_fd, &g_drm);
+    free(bmp_buf);
+    return 0;
+}
+
+static int face_init(void) {
+    rockx_ret_t ret;
+
+    ret = rockx_create(&g_face_det_handle, ROCKX_MODULE_FACE_DETECTION, NULL, 0);
+    if (ret != ROCKX_RET_SUCCESS) {
+        printf("init detection module error\n");
+        return -1;
+    }
+    g_face_det_ready = 1;
+
+    ret = rockx_create(&g_face_5landmarks_handle, ROCKX_MODULE_FACE_LANDMARK_5, NULL, 0);
+    if (ret != ROCKX_RET_SUCCESS) {
+        printf("init landmarks module error\n");
+        return -1;
+    }
+    g_face_5landmarks_ready = 1;
+
+    ret = rockx_create(&g_face_recognize_handle, ROCKX_MODULE_FACE_RECOGNIZE, NULL, 0);
+    if (ret != ROCKX_RET_SUCCESS) {
+        printf("init recognize module error\n");
+        return -1;
+    }
+    g_face_recognize_ready = 1;
+
+    return 0;
+}
+
+static rockx_object_t *get_max_face(rockx_object_array_t *face_array) {
+    rockx_object_t *max_face = NULL;
+
+    for (int i = 0; i < face_array->count; i++) {
+        rockx_object_t *cur_face = &face_array->object[i];
+        if (max_face == NULL) {
+            max_face = cur_face;
+            continue;
+        }
+
+        int cur_area = (cur_face->box.right - cur_face->box.left) *
+                       (cur_face->box.bottom - cur_face->box.top);
+        int max_area = (max_face->box.right - max_face->box.left) *
+                       (max_face->box.bottom - max_face->box.top);
+        if (cur_area > max_area) {
+            max_face = cur_face;
+        }
+    }
+
+    return max_face;
+}
+
+static int extract_face_feature(const char *image_path, rockx_face_feature_t *out_feature) {
+    rockx_image_t in_face;
+    rockx_image_t small_face;
+    rockx_object_array_t face_array;
+
+    memset(&in_face, 0, sizeof(in_face));
+    memset(&small_face, 0, sizeof(small_face));
+    memset(&face_array, 0, sizeof(face_array));
+    memset(out_feature, 0, sizeof(*out_feature));
+
+    if (rockx_image_read(image_path, &in_face, 1) != ROCKX_RET_SUCCESS) {
+        printf("read image failed: %s\n", image_path);
+        return -1;
+    }
+
+    rockx_ret_t ret = rockx_face_detect(g_face_det_handle, &in_face, &face_array, NULL);
+    if (ret != ROCKX_RET_SUCCESS) {
+        printf("detect face failed: %s\n", image_path);
+        rockx_image_release(&in_face);
+        return -1;
+    }
+
+    rockx_image_t *draw_img = rockx_image_clone(&in_face);
+    if (draw_img != NULL) {
+        for (int i = 0; i < face_array.count; i++) {
+            rockx_point_t pt1 = {face_array.object[i].box.left, face_array.object[i].box.top};
+            rockx_point_t pt2 = {face_array.object[i].box.right, face_array.object[i].box.bottom};
+            rockx_color_t color = {255, 0, 0};
+            rockx_image_draw_rect(draw_img, pt1, pt2, color, 3);
+        }
+        rockx_image_write(KEEP_FACE_BMP, draw_img);
+        rockx_image_release(draw_img);
+    }
+
+    rockx_object_t *max_face = get_max_face(&face_array);
+    if (max_face == NULL) {
+        printf("no face found: %s\n", image_path);
+        rockx_image_release(&in_face);
+        return -1;
+    }
+
+    printf("face count=%d max box left=%d top=%d right=%d bottom=%d score=%f\n",
+           face_array.count,
+           max_face->box.left,
+           max_face->box.top,
+           max_face->box.right,
+           max_face->box.bottom,
+           max_face->score);
+
+    ret = rockx_face_align(g_face_5landmarks_handle, &in_face, &max_face->box, NULL, &small_face);
+    if (ret != ROCKX_RET_SUCCESS) {
+        rockx_rect_t safe_box = max_face->box;
+        int bw = safe_box.right - safe_box.left;
+        int bh = safe_box.bottom - safe_box.top;
+        int margin_x = bw / 20;
+        int margin_y = bh / 20;
+
+        safe_box.left += margin_x;
+        safe_box.right -= margin_x;
+        safe_box.top += margin_y;
+        safe_box.bottom -= margin_y;
+
+        printf("face align failed ret=%d, retry with safe box left=%d top=%d right=%d bottom=%d\n",
+               ret, safe_box.left, safe_box.top, safe_box.right, safe_box.bottom);
+
+        memset(&small_face, 0, sizeof(small_face));
+        ret = rockx_face_align(g_face_5landmarks_handle, &in_face, &safe_box, NULL, &small_face);
+        if (ret != ROCKX_RET_SUCCESS) {
+            printf("face align retry failed ret=%d: %s\n", ret, image_path);
+            rockx_image_release(&in_face);
+            return -1;
+        }
+    }
+
+    ret = rockx_face_recognize(g_face_recognize_handle, &small_face, out_feature);
+    rockx_image_release(&in_face);
+    rockx_image_release(&small_face);
+
+    if (ret != ROCKX_RET_SUCCESS) {
+        printf("face recognize failed: %s\n", image_path);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int make_face_box_image(const char *src_path, const char *dst_path) {
+    rockx_image_t image;
+    rockx_object_array_t face_array;
+
+    memset(&image, 0, sizeof(image));
+    memset(&face_array, 0, sizeof(face_array));
+
+    if (rockx_image_read(src_path, &image, 1) != ROCKX_RET_SUCCESS) {
+        printf("read preview image failed: %s\n", src_path);
+        return -1;
+    }
+
+    rockx_ret_t ret = rockx_face_detect(g_face_det_handle, &image, &face_array, NULL);
+    if (ret != ROCKX_RET_SUCCESS) {
+        printf("preview face detect failed: %s\n", src_path);
+        rockx_image_release(&image);
+        return -1;
+    }
+
+    rockx_image_t *draw_img = rockx_image_clone(&image);
+    if (draw_img == NULL) {
+        rockx_image_release(&image);
+        return -1;
+    }
+
+    for (int i = 0; i < face_array.count; i++) {
+        rockx_point_t pt1 = {face_array.object[i].box.left, face_array.object[i].box.top};
+        rockx_point_t pt2 = {face_array.object[i].box.right, face_array.object[i].box.bottom};
+        rockx_color_t color = {255, 0, 0};
+        rockx_image_draw_rect(draw_img, pt1, pt2, color, 3);
+    }
+
+    ret = rockx_image_write(dst_path, draw_img);
+    rockx_image_release(draw_img);
+    rockx_image_release(&image);
+
+    if (ret != ROCKX_RET_SUCCESS) {
+        printf("write preview image failed: %s\n", dst_path);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int update_face_preview(const char *raw_path, const char *boxed_path) {
+    const char *show_path = raw_path;
+
+    if (get_bmp(g_video_fd, raw_path) == -1) {
+        printf("camera preview capture failed\n");
+        return -1;
+    }
+
+    if (make_face_box_image(raw_path, boxed_path) == 0) {
+        show_path = boxed_path;
+    }
+
+    if (bmp_draw_no_scale_region(show_path, PREVIEW_X, PREVIEW_Y, PREVIEW_W, PREVIEW_H) == -1) {
+        return -1;
+    }
+
+    DRMshowUp(g_drm_fd, &g_drm);
+    return 0;
+}
+
+static int capture_feature(const char *bmp_path, rockx_face_feature_t *feature) {
+    if (get_bmp(g_video_fd, bmp_path) == -1) {
+        printf("camera capture failed\n");
+        return -1;
+    }
+
+    return extract_face_feature(bmp_path, feature);
+}
+
+static int do_enroll(void) {
+    int x = 0;
+    int y = 0;
+    int has_frame = 0;
+
+    bmp_show("./2.bmp", 0, 0);
+    printf("enroll page: live preview 600x600 without scale, touch action button to capture face\n");
+
+    while (g_running) {
+        if (update_face_preview(ENROLL_RAW_BMP, ENROLL_BOX_BMP) == 0) {
+            has_frame = 1;
+        }
+
+        int touch_ret = poll_touch(&x, &y);
+        if (touch_ret < 0) {
+            return -1;
+        }
+
+        if (touch_ret == 1) {
+            if (!in_rect(x, y, BTN_ACTION_X1, BTN_ACTION_Y1, BTN_ACTION_X2, BTN_ACTION_Y2)) {
+                return 0;
+            }
+
+            if (!has_frame) {
+                printf("no preview frame ready\n");
+                return -1;
+            }
+
+            if (extract_face_feature(ENROLL_RAW_BMP, &g_enrolled_feature) == 0) {
+                g_enrolled_ready = 1;
+                printf("face enroll success\n");
+            } else {
+                printf("face enroll failed\n");
+            }
+            return 0;
+        }
+
+        usleep(50000);
+    }
+
+    return -1;
+}
+
+static int do_check(void) {
+    int x = 0;
+    int y = 0;
+    int has_frame = 0;
+    rockx_face_feature_t check_feature;
+    float similarity = 0.0f;
+
+    bmp_show("./3.bmp", 0, 0);
+    printf("check page: live preview 640x480 without scale, touch action button to capture face\n");
+
+    while (g_running) {
+        if (update_face_preview(CHECK_RAW_BMP, CHECK_BOX_BMP) == 0) {
+            has_frame = 1;
+        }
+
+        int touch_ret = poll_touch(&x, &y);
+        if (touch_ret < 0) {
+            return -1;
+        }
+
+        if (touch_ret == 1) {
+            if (!in_rect(x, y, BTN_ACTION_X1, BTN_ACTION_Y1, BTN_ACTION_X2, BTN_ACTION_Y2)) {
+                return 0;
+            }
+
+            if (!has_frame) {
+                printf("no preview frame ready\n");
+                return -1;
+            }
+
+            if (!g_enrolled_ready) {
+                printf("no enrolled face, please enroll first\n");
+                return -1;
+            }
+
+            if (extract_face_feature(CHECK_RAW_BMP, &check_feature) == -1) {
+                printf("check capture failed\n");
+                return -1;
+            }
+
+            rockx_face_feature_similarity(&check_feature, &g_enrolled_feature, &similarity);
+            printf("similarity = %f\n", similarity);
+            if (similarity > 0.0f && similarity <= FACE_MATCH_THRESHOLD) {
+                printf("attendance check success\n");
+            } else {
+                printf("attendance check failed\n");
+            }
+            return 0;
+        }
+
+        usleep(50000);
+    }
+
+    return -1;
+}
+
+static void cleanup(void) {
+    if (g_video_fd >= 0) {
+        free_video(g_video_fd);
+        g_video_fd = -1;
+    }
+
+    if (g_touch_fd >= 0) {
+        close(g_touch_fd);
+        g_touch_fd = -1;
+    }
+
+    if (g_drm_fd >= 0 && g_drm_ready) {
+        DRMfreeResources(g_drm_fd, &g_drm);
+    }
+
+    if (g_drm_fd >= 0) {
+        close(g_drm_fd);
+        g_drm_fd = -1;
+    }
+
+    if (g_face_det_ready) {
+        rockx_destroy(g_face_det_handle);
+        g_face_det_ready = 0;
+    }
+    if (g_face_5landmarks_ready) {
+        rockx_destroy(g_face_5landmarks_handle);
+        g_face_5landmarks_ready = 0;
+    }
+    if (g_face_recognize_ready) {
+        rockx_destroy(g_face_recognize_handle);
+        g_face_recognize_ready = 0;
+    }
+}
+
+int main(void) {
+    signal(SIGINT, handle_signal);
+    signal(SIGTERM, handle_signal);
+
+    if (ensure_face_dir() == -1) {
+        return -1;
+    }
+
+    g_drm_fd = open("/dev/dri/card0", O_RDWR);
+    if (g_drm_fd == -1) {
+        perror("open drm file error");
+        return -1;
+    }
+    DRMinit(g_drm_fd);
+    DRMcreateFB(g_drm_fd, &g_drm);
+    g_drm_ready = 1;
+
+    g_touch_fd = init_touch();
+    if (g_touch_fd == -1) {
+        cleanup();
+        return -1;
+    }
+
+    g_video_fd = init_video();
+    if (g_video_fd == -1) {
+        cleanup();
+        return -1;
+    }
+
+    if (face_init() == -1) {
+        cleanup();
+        return -1;
+    }
+
+    while (g_running) {
+        int x = 0;
+        int y = 0;
+
+        bmp_show("./1.bmp", 0, 0);
+        if (wait_touch(&x, &y) <= 0) {
+            break;
+        }
+
+        if (in_rect(x, y, BTN_ENROLL_X1, BTN_ENROLL_Y1, BTN_ENROLL_X2, BTN_ENROLL_Y2)) {
+            do_enroll();
+        } else if (in_rect(x, y, BTN_CHECK_X1, BTN_CHECK_Y1, BTN_CHECK_X2, BTN_CHECK_Y2)) {
+            do_check();
+        }
+    }
+
+    cleanup();
+    return 0;
+}
