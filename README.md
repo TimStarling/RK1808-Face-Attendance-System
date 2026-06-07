@@ -1,3 +1,9 @@
+<div align="right">
+
+[中文](README.md) | [English](README_EN.md)
+
+</div>
+
 # RK1808 人脸考勤系统
 
 这是一个面向 Rockchip RK1808 Linux 平台的人脸考勤示例项目。系统使用摄像头采集实时画面，通过 RockX/RKNN 完成人脸检测、关键点对齐与人脸特征匹配，并在 DRM 屏幕界面上提供人脸录入、考勤打卡、管理员查看/删除记录和补卡等功能。
